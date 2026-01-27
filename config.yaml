@@ -1,0 +1,16 @@
+# 策略参数
+min_pos: 0.3
+max_pos: 1.0
+commission: 0.0003
+
+# 模型参数
+hidden_dim: 128
+n_layers: 3
+
+# 训练参数
+lr: 0.00003
+gamma: 0.99
+batch_size: 64
+n_epochs: 10
+buffer_size: 512
+patience: 20
