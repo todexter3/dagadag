@@ -1,91 +1,66 @@
 import torch
 import torch.nn as nn
 import torch.optim as optim
-from torch.utils.data import DataLoader, TensorDataset
-
-from ppo_models import ActorCritic
-
+from models.PPO import ActorCritic
+import numpy as np
 
 class PPOAgent:
-    def __init__(
-        self,
-        state_dim,
-        n_assets,
-        lr=3e-4,
-        gamma=0.99,
-        gae_lambda=0.95,
-        clip_eps=0.2,
-        ent_coef=0.01,
-        vf_coef=0.5,
-        update_epochs=10,
-        batch_size=256,
-        device=None
-    ):
-        self.device = device or torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    def __init__(self, state_dim, args):
+        self.args = args
+        self.device = args.device
+        self.net = ActorCritic(state_dim).to(self.device)
+        self.optimizer = optim.Adam(self.net.parameters(), lr=args.lr)
+        self.buffer = []
 
-        self.net = ActorCritic(state_dim, n_assets).to(self.device)
-        self.optimizer = optim.Adam(self.net.parameters(), lr=lr)
+    def select_action(self, state, deterministic=False):
+        state = torch.FloatTensor(state).unsqueeze(0).to(self.device)
+        with torch.no_grad():
+            action, logp, value = self.net.act(state, deterministic)
+        return action.item(), logp.item(), value.item()
 
-        self.gamma = gamma
-        self.gae_lambda = gae_lambda
-        self.clip_eps = clip_eps
-        self.ent_coef = ent_coef
-        self.vf_coef = vf_coef
-        self.update_epochs = update_epochs
-        self.batch_size = batch_size
+    def store_transition(self, transition):
+        self.buffer.append(transition)
 
-    @torch.no_grad()
-    def select_action(self, state):
-        state = torch.FloatTensor(state).to(self.device)
-        action, logp, value = self.net.act(state)
-        return (
-            action.cpu().numpy(),
-            logp.cpu().numpy(),
-            value.cpu().numpy()
-        )
+    def update(self):
+        # 准备数据
+        states = torch.FloatTensor(np.array([t[0] for t in self.buffer])).to(self.device)
+        actions = torch.FloatTensor(np.array([t[1] for t in self.buffer])).unsqueeze(-1).to(self.device)
+        
+        
+        rewards = [t[2] for t in self.buffer]
+        dones = [t[4] for t in self.buffer]
+        old_logps = torch.FloatTensor(np.array([t[5] for t in self.buffer])).to(self.device)
 
-    def compute_gae(self, rewards, values, dones, last_value):
-        advantages = []
-        gae = 0
-        values = values + [last_value]
+        
+        # 计算 GAE 和 Returns
+        returns = []
+        discounted_sum = 0
+        for r, d in zip(reversed(rewards), reversed(dones)):
+            if d: discounted_sum = 0
+            discounted_sum = r + self.args.gamma * discounted_sum
+            returns.insert(0, discounted_sum)
+        returns = torch.FloatTensor(returns).to(self.device)
+        
+        # 评估当前值
+        _, _, values = self.net.forward(states)
+        values = values.squeeze(-1).detach()
+        advantages = returns - values
+        advantages = (advantages - advantages.mean()) / (advantages.std() + 1e-8)
 
-        for t in reversed(range(len(rewards))):
-            delta = rewards[t] + self.gamma * values[t+1] * (1 - dones[t]) - values[t]
-            gae = delta + self.gamma * self.gae_lambda * (1 - dones[t]) * gae
-            advantages.insert(0, gae)
+        # PPO 更新
+        for _ in range(self.args.n_epochs):
+            new_logps, entropy, new_values = self.net.evaluate(states, actions)
+            ratio = torch.exp(new_logps - old_logps)
+            
+            surr1 = ratio * advantages
+            surr2 = torch.clamp(ratio, 1 - self.args.clip_eps, 1 + self.args.clip_eps) * advantages
+            
+            policy_loss = -torch.min(surr1, surr2).mean()
+            value_loss = nn.MSELoss()(new_values.squeeze(-1), returns)
+            loss = policy_loss + 0.5 * value_loss - 0.01 * entropy.mean()
 
-        returns = [adv + val for adv, val in zip(advantages, values[:-1])]
-        return advantages, returns
-
-    def update(self, buffer):
-        states, actions, logps_old, returns, advs = buffer
-
-        advs = (advs - advs.mean()) / (advs.std() + 1e-8)
-
-        dataset = TensorDataset(
-            states, actions, logps_old, returns, advs
-        )
-        loader = DataLoader(dataset, batch_size=self.batch_size, shuffle=True)
-
-        for _ in range(self.update_epochs):
-            for s, a, logp_old, ret, adv in loader:
-                logp, entropy, value = self.net.evaluate(s, a)
-
-                ratio = torch.exp(logp - logp_old)
-                surr1 = ratio * adv
-                surr2 = torch.clamp(ratio, 1 - self.clip_eps, 1 + self.clip_eps) * adv
-
-                policy_loss = -torch.min(surr1, surr2).mean()
-                value_loss = nn.MSELoss()(value.squeeze(-1), ret)
-                entropy_loss = -entropy.mean()
-
-                loss = (
-                    policy_loss
-                    + self.vf_coef * value_loss
-                    + self.ent_coef * entropy_loss
-                )
-
-                self.optimizer.zero_grad()
-                loss.backward()
-                nn.utils.clip_grad_norm_(self.net.parameters(), 1.0)
-                self.optimizer.step()
+            self.optimizer.zero_grad()
+            loss.backward()
+            self.optimizer.step()
+            
+        self.buffer = [] # 清空 buffer
