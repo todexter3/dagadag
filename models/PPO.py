@@ -33,8 +33,8 @@ class ActorCritic(nn.Module):
     def forward(self, state):
         z = self.feature(state)
         
-        alpha = torch.clamp(F.softplus(self.alpha_head(z)) + 1.0, 1.0, self.args.alpha_max)
-        beta  = torch.clamp(F.softplus(self.beta_head(z))  + 1.0, 1.0, self.args.beta_max)
+        alpha = torch.clamp(F.softplus(self.alpha_head(z)) + 1.0, 1.0, self.args.alpha_init)
+        beta  = torch.clamp(F.softplus(self.beta_head(z))  + 1.0, 1.0, self.args.beta_init)
 
         value = self.value_head(z)
         return alpha, beta, value
