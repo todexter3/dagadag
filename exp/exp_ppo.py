@@ -16,19 +16,18 @@ class Exp_PPO:
         self.train_env = TimingEnv(self.data.iloc[:split], args)
         self.test_env = TimingEnv(self.data.iloc[split:], args)
         
-        # 获取状态维度 (特征数 + 1个持仓位)
         sample_obs = self.train_env.reset()
         self.agent = PPOAgent(len(sample_obs), args)
 
     def train(self):
-        for ep in range(50):
+        for ep in range(self.args.n_epochs):
             state = self.train_env.reset()
             ep_reward = 0
             done = False
             while not done:
                 action, logp, val = self.agent.select_action(state)
                 next_state, reward, done, info = self.train_env.step(action)
-                self.agent.store_transition((state, action, reward, next_state, done, logp))
+                self.agent.store_transition((state, action, reward, done, logp,val))
                 state = next_state
                 ep_reward += reward
                 
@@ -50,7 +49,6 @@ class Exp_PPO:
             results.append(info)
             state = next_state
         
-        # 评估与绘图
         res_df = pd.DataFrame(results)
         res_df['excess_ret'] = res_df['agent_ret'] - res_df['bench_ret']
         res_df['cum_agent'] = (1 + res_df['agent_ret']).cumprod()
@@ -60,8 +58,34 @@ class Exp_PPO:
         res_df.to_csv(os.path.join(self.args.res_path, 'test_results.csv'))
         print(f"Test Complete. Final Excess PNL: {res_df['cum_excess'].iloc[-1]:.4f}")
         
-        # 简单绘图
-        plt.figure(figsize=(10, 5))
-        plt.plot(res_df['cum_excess'], label='Cumulative Excess PNL')
+
+        plt.figure(figsize=(12, 15))
+
+        plt.subplot(3, 1, 1)
+        plt.plot(res_df['cum_agent'], label='Agent Strategy', color='red')
+        plt.plot(res_df['cum_bench'], label='Benchmark (Buy & Hold)', color='blue', linestyle='--')
+        plt.title('Cumulative Returns Comparison')
         plt.legend()
-        plt.savefig(os.path.join(self.args.res_path, 'excess_pnl.png'))
+        plt.grid(True)
+
+        plt.subplot(3, 1, 2)
+        plt.fill_between(res_df.index, res_df['cum_excess'], 0, 
+                         where=(res_df['cum_excess'] >= 0), facecolor='green', alpha=0.3)
+        plt.fill_between(res_df.index, res_df['cum_excess'], 0, 
+                         where=(res_df['cum_excess'] < 0), facecolor='red', alpha=0.3)
+        plt.plot(res_df['cum_excess'], label='Cumulative Excess Return (Alpha)', color='black')
+        plt.title('Alpha Curve')
+        plt.legend()
+        plt.grid(True)
+
+        plt.subplot(3, 1, 3)
+        plt.plot(res_df['pos'], label='Agent Position (Weight)', color='orange', linewidth=1)
+        plt.ylim(-0.1, 1.1) 
+        plt.title('Portfolio Position Over Time')
+        plt.ylabel('Weight')
+        plt.legend()
+        plt.grid(True)
+
+        plt.tight_layout()
+        plt.savefig(os.path.join(self.args.res_path, 'performance_analysis.png'))
+        plt.close()
