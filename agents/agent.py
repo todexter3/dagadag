@@ -1,66 +1,130 @@
 import torch
 import torch.nn as nn
 import torch.optim as optim
-from models.PPO import ActorCritic
 import numpy as np
+from models.PPO import ActorCritic
+
 
 class PPOAgent:
     def __init__(self, state_dim, args):
         self.args = args
         self.device = args.device
-        self.net = ActorCritic(state_dim).to(self.device)
+
+        self.net = ActorCritic(
+            args=self.args,
+            state_dim=state_dim,
+            hidden_dim=args.hidden_dim,
+            n_layers=args.n_layers
+        ).to(self.device)
+
         self.optimizer = optim.Adam(self.net.parameters(), lr=args.lr)
         self.buffer = []
 
+    # Action selection
     def select_action(self, state, deterministic=False):
         state = torch.FloatTensor(state).unsqueeze(0).to(self.device)
+
         with torch.no_grad():
-            action, logp, value = self.net.act(state, deterministic)
-        return action.item(), logp.item(), value.item()
+            action_raw, logp, value = self.net.act(state, deterministic)
+
+        action = action_raw.clamp(0.0, 1.0)
+
+        return (
+            action.item(),
+            logp.item(),
+            value.item()
+        )
+
 
     def store_transition(self, transition):
         self.buffer.append(transition)
 
-    def update(self):
-        # 准备数据
-        states = torch.FloatTensor(np.array([t[0] for t in self.buffer])).to(self.device)
-        actions = torch.FloatTensor(np.array([t[1] for t in self.buffer])).unsqueeze(-1).to(self.device)
-        
-        
-        rewards = [t[2] for t in self.buffer]
-        dones = [t[4] for t in self.buffer]
-        old_logps = torch.FloatTensor(np.array([t[5] for t in self.buffer])).to(self.device)
 
-        
-        # 计算 GAE 和 Returns
-        returns = []
-        discounted_sum = 0
-        for r, d in zip(reversed(rewards), reversed(dones)):
-            if d: discounted_sum = 0
-            discounted_sum = r + self.args.gamma * discounted_sum
-            returns.insert(0, discounted_sum)
-        returns = torch.FloatTensor(returns).to(self.device)
-        
-        # 评估当前值
-        _, _, values = self.net.forward(states)
-        values = values.squeeze(-1).detach()
-        advantages = returns - values
+    def update(self):
+        states = torch.as_tensor(
+            np.stack([t[0] for t in self.buffer]),
+            dtype=torch.float32,
+            device=self.device
+        )
+
+        actions = torch.as_tensor(
+            [t[1] for t in self.buffer],
+            dtype=torch.float32,
+            device=self.device
+        ).unsqueeze(-1)
+
+        rewards = torch.as_tensor(
+            [t[2] for t in self.buffer],
+            dtype=torch.float32,
+            device=self.device
+        )
+
+        dones = torch.as_tensor(
+            [1.0 if bool(t[3]) else 0.0 for t in self.buffer],
+            dtype=torch.float32,
+            device=self.device
+        )
+
+        old_logps = torch.as_tensor(
+            [t[4] for t in self.buffer],
+            dtype=torch.float32,
+            device=self.device
+        )
+
+        old_values = torch.as_tensor(
+            [t[5] for t in self.buffer],
+            dtype=torch.float32,
+            device=self.device
+        )
+
+        # GAE
+        T = rewards.size(0)
+        advantages = torch.zeros(T, device=self.device)
+        returns = torch.zeros(T, device=self.device)
+
+        gae = 0.0
+
+        for t in reversed(range(T)):
+            next_value = old_values[t + 1] if t < T - 1 else 0.0
+
+            delta = rewards[t] \
+                    + self.args.gamma * next_value * (1.0 - dones[t]) \
+                    - old_values[t]
+
+            gae = delta + self.args.gamma * self.args.gae_lambda * (1.0 - dones[t]) * gae
+            advantages[t] = gae
+            returns[t] = gae + old_values[t]
+
+
+        # normalize advantage
         advantages = (advantages - advantages.mean()) / (advantages.std() + 1e-8)
 
-        # PPO 更新
+        # Optimization
         for _ in range(self.args.n_epochs):
-            new_logps, entropy, new_values = self.net.evaluate(states, actions)
-            ratio = torch.exp(new_logps - old_logps)
-            
+            logps, entropy, values = self.net.evaluate(states, actions)
+            values = values.squeeze(-1)
+
+            ratio = torch.exp(logps - old_logps)
             surr1 = ratio * advantages
-            surr2 = torch.clamp(ratio, 1 - self.args.clip_eps, 1 + self.args.clip_eps) * advantages
-            
+            surr2 = torch.clamp(
+                ratio,
+                1 - self.args.clip_eps,
+                1 + self.args.clip_eps
+            ) * advantages
+
             policy_loss = -torch.min(surr1, surr2).mean()
-            value_loss = nn.MSELoss()(new_values.squeeze(-1), returns)
-            loss = policy_loss + 0.5 * value_loss - 0.01 * entropy.mean()
+            value_loss = 0.5 * (returns - values).pow(2).mean()
+            entropy_loss = entropy.mean()
+
+            loss = (
+                policy_loss
+                + self.args.vf_coef * value_loss
+                - self.args.ent_coef * entropy_loss
+            )
 
             self.optimizer.zero_grad()
             loss.backward()
+            nn.utils.clip_grad_norm_(self.net.parameters(), 0.5)
             self.optimizer.step()
-            
-        self.buffer = [] # 清空 buffer
+
+        self.buffer.clear()
